@@ -1,53 +1,55 @@
-from flask import Flask, request, jsonify
 import re
+
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
 
-def is_full_lowercase_sha(value):
-    """
-    A valid full Git commit SHA for this assignment must be:
-    - exactly 40 characters
-    - lowercase hexadecimal
-    """
-    return isinstance(value, str) and bool(
-        re.fullmatch(r"[0-9a-f]{40}", value)
-    )
+# ---------------------------------------------------------
+# Helper: check for a full 40-character lowercase SHA
+# ---------------------------------------------------------
+def is_full_sha(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
 
 
+# ---------------------------------------------------------
+# Main policy
+# ---------------------------------------------------------
 def evaluate_release_gate(data):
     violations = []
 
-    workflow = data.get("workflow") or {}
-    image = data.get("image") or {}
-    permissions = workflow.get("permissions") or {}
+    # Safely get nested objects
+    workflow = data.get("workflow")
+    image = data.get("image")
 
-    # ---------------------------------------------------------
+    if not isinstance(workflow, dict):
+        workflow = {}
+
+    if not isinstance(image, dict):
+        image = {}
+
+    permissions = workflow.get("permissions")
+
+    if not isinstance(permissions, dict):
+        permissions = {}
+
+    # =====================================================
     # 1. PERMISSIONS
-    # ---------------------------------------------------------
+    # =====================================================
 
-    expected_permissions = {
-        "contents": "read",
-        "packages": "write",
-        "id-token": "none"
-    }
+    expected_permissions = {"contents": "read", "packages": "write", "id-token": "none"}
 
-    # Must contain exactly the expected permissions.
     if permissions != expected_permissions:
         violations.append("EXCESS_PERMISSION")
 
-    # ---------------------------------------------------------
+    # =====================================================
     # 2. PULL REQUEST RULES
-    # ---------------------------------------------------------
+    # =====================================================
 
     if data.get("event") == "pull_request":
-
-        # PR must use pull_request, never pull_request_target
         if workflow.get("trigger") != "pull_request":
             violations.append("UNSAFE_PR_TRIGGER")
 
-        # Tests must pass, matrix must be complete,
-        # and failFast must be false.
         if (
             workflow.get("testsPassed") is not True
             or workflow.get("matrixComplete") is not True
@@ -55,113 +57,93 @@ def evaluate_release_gate(data):
         ):
             violations.append("TESTS_INCOMPLETE")
 
-    # ---------------------------------------------------------
-    # 3. GITHUB ACTION PINNING
-    # ---------------------------------------------------------
+    # =====================================================
+    # 3. ACTION PINNING
+    # =====================================================
 
-    actions = workflow.get("actions") or []
+    actions = workflow.get("actions", [])
+
+    if not isinstance(actions, list):
+        actions = []
 
     for action in actions:
-        owner = action.get("owner")
-        ref = action.get("ref")
-
-        # Official actions owned by "actions" may use a tag.
-        if owner == "actions":
-            continue
-
-        # Every third-party action must use a full 40-character
-        # lowercase hexadecimal commit SHA.
-        if not is_full_lowercase_sha(ref):
+        if not isinstance(action, dict):
             violations.append("MUTABLE_ACTION")
             break
 
-    # ---------------------------------------------------------
-    # 4. DOCKER IMAGE RULES
-    # ---------------------------------------------------------
+        owner = action.get("owner")
+        ref = action.get("ref")
 
-    # Must be multi-stage.
+        # actions/* may use version tags
+        if owner == "actions":
+            continue
+
+        # Every other action requires a full lowercase SHA
+        if not is_full_sha(ref):
+            violations.append("MUTABLE_ACTION")
+            break
+
+    # =====================================================
+    # 4. IMAGE SECURITY
+    # =====================================================
+
     if image.get("multiStage") is not True:
         violations.append("SINGLE_STAGE_IMAGE")
 
-    # Must not run as root.
     if image.get("runsAsRoot") is not False:
         violations.append("ROOT_RUNTIME")
 
-    # Safe secret modes are only:
-    #   none
-    #   buildkit
-    secret_mode = image.get("secretMode")
-
-    if secret_mode not in ("none", "buildkit"):
+    if image.get("secretMode") not in ("none", "buildkit"):
         violations.append("SECRET_IN_LAYER")
 
-    # Must have zero critical vulnerabilities.
     if image.get("criticalVulnerabilities") != 0:
         violations.append("CRITICAL_CVE")
 
-    # Image must be digest pinned.
     if image.get("digestPinned") is not True:
         violations.append("UNPINNED_IMAGE")
 
-    # ---------------------------------------------------------
-    # 5. PRODUCTION RULES
-    # ---------------------------------------------------------
+    # =====================================================
+    # 5. PRODUCTION
+    # =====================================================
 
     if data.get("target") == "production":
-
-        # Production must be a push to main.
-        if (
-            data.get("event") != "push"
-            or data.get("ref") != "refs/heads/main"
-        ):
+        if data.get("event") != "push" or data.get("ref") != "refs/heads/main":
             violations.append("INVALID_PRODUCTION_REF")
 
-        # Production requires environment approval.
         if workflow.get("environmentApproval") is not True:
             violations.append("APPROVAL_REQUIRED")
 
-    # ---------------------------------------------------------
-    # FINAL DECISION
-    # ---------------------------------------------------------
-
-    if violations:
-        decision = "block"
-    else:
-        decision = "promote"
+    # =====================================================
+    # FINAL RESULT
+    # =====================================================
 
     return {
-        "decision": decision,
-        "violations": violations
+        "decision": "promote" if len(violations) == 0 else "block",
+        "violations": violations,
     }
 
 
-# -------------------------------------------------------------
-# POST /release-gate
-# -------------------------------------------------------------
-
+# ---------------------------------------------------------
+# API endpoint
+# ---------------------------------------------------------
 @app.route("/release-gate", methods=["POST"])
 def release_gate():
+
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
-        return jsonify({
-            "decision": "block",
-            "violations": ["INVALID_REQUEST"]
-        }), 400
+        return jsonify({"decision": "block", "violations": []})
 
-    result = evaluate_release_gate(data)
-
-    return jsonify(result)
+    return jsonify(evaluate_release_gate(data))
 
 
-# Optional health endpoint
+# ---------------------------------------------------------
+# Health check
+# ---------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=5000
-    )
+    app.run(host="0.0.0.0", port=5000)
